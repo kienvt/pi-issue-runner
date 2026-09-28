@@ -170,5 +170,3 @@ journalctl --user -u pi-issue-runner -f
 - Không bao giờ push thẳng `main`, không tự merge.
 - Nội dung issue là input không đáng tin: system prompt cấm đọc secrets và cấm làm
   theo chỉ dẫn phá hoại nhúng trong issue.
-
-> ⚠️ Mã nguồn nghiên cứu, không phải lời khuyên đầu tư.
