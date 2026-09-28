@@ -107,6 +107,29 @@ Tùy biến hoàn toàn cho CLI khác:
 ```
 Placeholders: `{prompt}`, `{model}`, `{session}`, `{system_prompt}`.
 
+## Auto-review Pull Request
+
+Sau khi agent đẩy/ cập nhật PR, runner tự chạy một agent **review độc lập** trên chính
+PR đó và đăng comment review lên PR.
+
+- **Căn cứ review**: `review-rules.md` + `review-system-prompt.md`, rule & kiến trúc
+  của repo (`AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `README` / `docs/`), và diff của PR.
+- **Bối cảnh**: issue gốc + toàn bộ comment của issue (bỏ comment do runner đăng).
+- **Không sửa file**, không commit/push; chỉ đọc và nhận xét.
+- **Kết quả**: comment `## 🔍 AI Review` với `Verdict` (APPROVE / COMMENT / REQUEST_CHANGES)
+  và findings theo mức `BLOCKER` / `MAJOR` / `MINOR` / `NIT`.
+
+Cấu hình trong `repos.json`:
+
+```json
+"review": { "enabled": true, "agent": "pi", "model": "" }
+```
+Để trống `agent`/`model` thì dùng mặc định chung. Đặt `"enabled": false` để tắt.
+
+> Review chạy sau cả khi tạo PR mới và khi cập nhật PR theo feedback, nên mỗi lần
+> code đổi đều có review tương ứng. Comment review có marker `<!-- pi-runner -->`
+> nên không tự kích hoạt vòng lặp.
+
 ## Session & bộ nhớ
 
 Mỗi issue = một session cố định (`--session-id <Repo>-issue-<n>`). PR feedback dùng

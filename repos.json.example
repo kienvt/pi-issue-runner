@@ -11,6 +11,11 @@
       "failed": "ai-failed"
     }
   },
+  "review": {
+    "enabled": true,
+    "agent": "pi",
+    "model": ""
+  },
   "defaults": {
     "agent": "pi",
     "labels": ["ai", "agent"],

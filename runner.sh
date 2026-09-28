@@ -79,6 +79,10 @@ WT_ROOT=$(jq -r '.runner.worktree_root // "'"$RUNNER_DIR"'/worktrees"' "$CONFIG"
 if [ -z "$DRY_RUN" ]; then DRY_RUN=$(jq -r '.runner.dry_run // false' "$CONFIG"); fi
 mkdir -p "$WT_ROOT"
 
+REV_ENABLED=$(jq -r '.review.enabled // true' "$CONFIG")
+REV_MODEL=$(jq -r '.review.model // empty' "$CONFIG")
+REV_AGENT_JSON=$(jq -c '.review.agent // empty' "$CONFIG"); [ -z "$REV_AGENT_JSON" ] && REV_AGENT_JSON="$DEF_AGENT_JSON"
+
 TASKS_DONE=0
 
 is_dry() { [ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "1" ]; }
@@ -134,7 +138,8 @@ run_agent() {
   local wt="$1" skey="$2" model="$3" pfile="$4" out="$5" err="$6" agent_json="$7"
   local type
   type=$(jq -r 'if type=="object" then (.type // "custom") else . end' <<<"$agent_json")
-  local sp1="$RUNNER_DIR/system-prompt.md" sp2="$RUNNER_DIR/task-rules.md"
+  local sp1="${8:-$RUNNER_DIR/system-prompt.md}"
+  local sp2="${9:-$RUNNER_DIR/task-rules.md}"
   local prompt; prompt="$(cat "$pfile")"
   local rc=0
 
@@ -207,6 +212,79 @@ run_agent() {
       ;;
   esac
   return $rc
+}
+
+# run_review <name> <fullname> <model> <agent_json> <issue_num> <pr_num> <wt>
+# Chạy agent review độc lập trên PR (không sửa file), rồi đăng comment lên PR.
+run_review() {
+  local name="$1" fullname="$2" model="$3" agent_json="$4" issue_num="$5" pr_num="$6" wt="$7"
+  is_dry && return 0
+  [ "$REV_ENABLED" = "true" ] || return 0
+  [ -n "$pr_num" ] || return 0
+
+  local base
+  base=$(gh pr view "$pr_num" -R "$fullname" --json baseRefName --jq '.baseRefName' 2>/dev/null)
+  [ -n "$base" ] || base="main"
+
+  local issue_ctx=""
+  if [ -n "$issue_num" ]; then
+    issue_ctx=$(gh issue view "$issue_num" -R "$fullname" --json title,body,comments --jq '
+        "# " + .title + "\n\n" + (.body // "") + "\n\n## Comments\n" +
+        ([.comments[]
+          | select(((.body // "") | contains("<!-- pi-runner -->") | not))
+          | "- @" + .author.login + ": " + (.body // "")] | join("\n"))' 2>/dev/null)
+  fi
+
+  local diffstat
+  diffstat=$(git -C "$wt" diff --stat "origin/$base...HEAD" 2>/dev/null | tail -40)
+
+  local pfile; pfile=$(mktemp)
+  {
+    echo "# Yêu cầu review Pull Request"
+    echo
+    echo "- Repo: \`$fullname\`"
+    echo "- PR: #$pr_num (base: \`$base\`)"
+    [ -n "$issue_num" ] && echo "- Issue liên quan: #$issue_num"
+    echo
+    if [ -n "$issue_ctx" ]; then
+      echo "## Bối cảnh issue (body + comments)"
+      echo
+      echo "$issue_ctx"
+      echo
+    fi
+    echo "## Tóm tắt thay đổi (diffstat)"
+    echo '```'
+    echo "${diffstat:-<không có>}"
+    echo '```'
+    echo
+    echo "## Việc cần làm"
+    echo "- Xem diff đầy đủ: \`git diff origin/$base...HEAD\` và mở các file liên quan (dùng tool đọc file)."
+    echo "- Đọc AGENTS.md / CLAUDE.md / CONTRIBUTING.md / README / docs để nắm rule & kiến trúc của repo."
+    echo "- Đánh giá theo đúng \`review-rules.md\`."
+    echo "- KHÔNG sửa file, KHÔNG commit/push, KHÔNG chạy gh. Chỉ xuất nội dung review cuối cùng."
+  } >"$pfile"
+
+  local rev_model="$model"; [ -n "$REV_MODEL" ] && rev_model="$REV_MODEL"
+  local out_log err_log run_log rc
+  out_log=$(mktemp); err_log=$(mktemp)
+  run_log="$LOG_DIR/${fullname//\//__}_review-pr-${pr_num}_$(date +%Y%m%d-%H%M%S).log"
+  log "  Review PR #$pr_num..."
+  run_agent "$wt" "${name}-review-issue-${issue_num:-$pr_num}" "$rev_model" "$pfile" \
+            "$out_log" "$err_log" "$REV_AGENT_JSON" \
+            "$RUNNER_DIR/review-system-prompt.md" "$RUNNER_DIR/review-rules.md"
+  rc=$?
+  { echo "===== review stdout ====="; cat "$out_log"; echo "===== review stderr ====="; cat "$err_log"; } >"$run_log"
+  rm -f "$pfile"
+
+  local body
+  body=$(truncate_tail "$out_log" 12000)
+  [ -n "$body" ] || body=$(printf 'Review thất bại (rc=%s). Xem log: `%s`' "$rc" "$run_log")
+  if gh pr comment "$pr_num" -R "$fullname" --body "$BOT_MARKER
+$body" >/dev/null 2>>"$LOG_FILE"; then
+    log "  Đã đăng AI review lên PR #$pr_num (rc=$rc)"
+  else
+    log "  Đăng AI review thất bại PR #$pr_num"
+  fi
 }
 
 # ---- one issue --------------------------------------------------------------
@@ -389,6 +467,11 @@ $txt" >/dev/null 2>>"$LOG_FILE" && log "  Comment posted on $key" || log "  Comm
     post_comment "$(printf '🤖 Đã chạy agent nhưng **không có thay đổi** nào được tạo.\n\n```\n%s\n```' "$summary")"
   fi
 
+  # --- auto review PR -------------------------------------------------------
+  if [ "$rc" -eq 0 ] && [ -n "$pr_url" ]; then
+    run_review "$name" "$fullname" "$model" "$agent_json" "$num" "${pr_url##*/}" "$wt"
+  fi
+
   # --- status label ---------------------------------------------------------
   local final_label
   if [ "$rc" -ne 0 ] || { [ "$made_changes" = true ] && [ -z "$pr_url" ]; }; then
@@ -567,6 +650,11 @@ process_pr_feedback() {
   fi
   gh pr comment "$prnum" -R "$fullname" --body "$BOT_MARKER
 $msg" >/dev/null 2>>"$LOG_FILE" || true
+
+  # --- auto review PR -------------------------------------------------------
+  if [ "$rc" -eq 0 ] && [ "$pushed" = true ]; then
+    run_review "$name" "$fullname" "$model" "$agent_json" "$linked" "$prnum" "$wt"
+  fi
 
   [ -n "$linked" ] && set_issue_status "$linked" "$fullname" "$final_label" "$LBL_RUNNING"
 

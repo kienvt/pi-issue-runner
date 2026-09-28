@@ -80,6 +80,8 @@ cp -f "$PKG_DIR/runner.sh"        "$INSTALL_DIR/runner.sh"
 cp -f "$PKG_DIR/setup-repo.sh"    "$INSTALL_DIR/setup-repo.sh"
 cp -f "$PKG_DIR/system-prompt.md" "$INSTALL_DIR/system-prompt.md"
 cp -f "$PKG_DIR/task-rules.md"    "$INSTALL_DIR/task-rules.md"
+cp -f "$PKG_DIR/review-system-prompt.md" "$INSTALL_DIR/review-system-prompt.md"
+cp -f "$PKG_DIR/review-rules.md"  "$INSTALL_DIR/review-rules.md"
 cp -f "$PKG_DIR/README.md"        "$INSTALL_DIR/README.md"
 chmod 755 "$INSTALL_DIR/runner.sh" "$INSTALL_DIR/setup-repo.sh"
 
