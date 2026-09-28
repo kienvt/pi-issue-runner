@@ -84,6 +84,7 @@ REV_MODEL=$(jq -r '.review.model // empty' "$CONFIG")
 REV_AGENT_JSON=$(jq -c '.review.agent // empty' "$CONFIG"); [ -z "$REV_AGENT_JSON" ] && REV_AGENT_JSON="$DEF_AGENT_JSON"
 
 TASKS_DONE=0
+REVIEW_MODE=0   # =1 khi đang chạy review (agent chỉ-đọc)
 
 is_dry() { [ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "1" ]; }
 
@@ -149,6 +150,7 @@ run_agent() {
     pi)
       local -a args=(--print --approve --session-id "$skey")
       [ -n "$model" ] && args+=(--model "$model")
+      [ "$REVIEW_MODE" = 1 ] && args+=(--exclude-tools edit,write)
       args+=(--append-system-prompt "$sp1" --append-system-prompt "$sp2" "$prompt")
       ( cd "$wt" && timeout "$PI_TIMEOUT" pi "${args[@]}" ) >"$out" 2>"$err"; rc=$?
       ;;
@@ -158,14 +160,17 @@ run_agent() {
       local -a args=(--print --auto-approve --session-dir "$sdir")
       [ -n "$(ls -A "$sdir" 2>/dev/null)" ] && args+=(--continue)
       [ -n "$model" ] && args+=(--model "$model")
+      [ "$REVIEW_MODE" = 1 ] && args+=(--tools=read,grep,find,ls,bash)
       args+=(--append-system-prompt "$sp1" --append-system-prompt "$sp2" "$prompt")
       ( cd "$wt" && timeout "$PI_TIMEOUT" omp "${args[@]}" ) >"$out" 2>"$err"; rc=$?
       ;;
     claude)
       local uuid; uuid="$(uuid_from_key "$skey")"
       local sp; sp="$(cat "$sp1"; printf '\n\n'; cat "$sp2")"
+      local allowed="Bash Edit Write Read Glob Grep WebFetch"
+      [ "$REVIEW_MODE" = 1 ] && allowed="Bash Read Glob Grep WebFetch"
       local -a args=(-p --output-format json --permission-mode acceptEdits \
-                     --allowedTools Bash Edit Write Read Glob Grep WebFetch \
+                     --allowedTools $allowed \
                      --session-id "$uuid")
       [ -n "$model" ] && args+=(--model "$model")
       args+=(--append-system-prompt "$sp" "$prompt")
@@ -183,9 +188,11 @@ run_agent() {
       local sdir="$RUNNER_DIR/agent-sessions/codex"; mkdir -p "$sdir"
       local sidfile="$sdir/$skey.id"
       if [ -f "$sidfile" ] && [ -n "$(cat "$sidfile" 2>/dev/null)" ]; then
-        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec resume "$(cat "$sidfile")" --full-auto "$full" ) >"$out" 2>"$err"; rc=$?
+        local sbx="--full-auto"; [ "$REVIEW_MODE" = 1 ] && sbx="--sandbox read-only"
+        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec resume "$(cat "$sidfile")" $sbx "$full" ) >"$out" 2>"$err"; rc=$?
       else
-        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec --full-auto --json "$full" ) >"$out.raw" 2>"$err"; rc=$?
+        local sbx="--full-auto"; [ "$REVIEW_MODE" = 1 ] && sbx="--sandbox read-only"
+        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec $sbx --json "$full" ) >"$out.raw" 2>"$err"; rc=$?
         jq -r 'select(.type=="session.created" or .type=="thread.started") | (.session_id // .thread_id // empty)' "$out.raw" 2>/dev/null | head -1 > "$sidfile"
         jq -r 'select(.type=="item.completed") | (.item.text // empty)' "$out.raw" 2>/dev/null | tail -1 > "$out"
         [ -s "$out" ] || cp "$out.raw" "$out"
@@ -269,10 +276,15 @@ run_review() {
   out_log=$(mktemp); err_log=$(mktemp)
   run_log="$LOG_DIR/${fullname//\//__}_review-pr-${pr_num}_$(date +%Y%m%d-%H%M%S).log"
   log "  Review PR #$pr_num..."
+  REVIEW_MODE=1
   run_agent "$wt" "${name}-review-issue-${issue_num:-$pr_num}" "$rev_model" "$pfile" \
             "$out_log" "$err_log" "$REV_AGENT_JSON" \
             "$RUNNER_DIR/review-system-prompt.md" "$RUNNER_DIR/review-rules.md"
   rc=$?
+  REVIEW_MODE=0
+  if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    log "  [!] review để lại thay đổi trong worktree — sẽ bị bỏ, không commit/push."
+  fi
   { echo "===== review stdout ====="; cat "$out_log"; echo "===== review stderr ====="; cat "$err_log"; } >"$run_log"
   rm -f "$pfile"
 

@@ -116,6 +116,10 @@ PR đó và đăng comment review lên PR.
   của repo (`AGENTS.md` / `CLAUDE.md` / `CONTRIBUTING.md` / `README` / `docs/`), và diff của PR.
 - **Bối cảnh**: issue gốc + toàn bộ comment của issue (bỏ comment do runner đăng).
 - **Không sửa file**, không commit/push; chỉ đọc và nhận xét.
+- **Chỉ-đọc (defense-in-depth)**: review agent bị giới hạn tool — `pi`: `--exclude-tools edit,write`;
+  `omp`: allowlist `read,grep,find,ls,bash`; `claude`: bỏ `Edit`/`Write`; `codex`: `--sandbox read-only`.
+  Ngoài ra review chạy **sau** bước commit/push nên runner không bao giờ commit/push phần review;
+  worktree bị xoá ngay sau đó → mọi thay đổi (nếu có) đều bị bỏ.
 - **Kết quả**: comment `## 🔍 AI Review` với `Verdict` (APPROVE / COMMENT / REQUEST_CHANGES)
   và findings theo mức `BLOCKER` / `MAJOR` / `MINOR` / `NIT`.
 
