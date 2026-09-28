@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Pi issue runner every 2 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+RandomizedDelaySec=15
+Persistent=true
+Unit=pi-issue-runner.service
+
+[Install]
+WantedBy=timers.target

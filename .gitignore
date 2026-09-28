@@ -1,0 +1,6 @@
+env
+repos.json
+state/
+logs/
+worktrees/
+*.tar.gz

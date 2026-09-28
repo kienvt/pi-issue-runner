@@ -1,0 +1,13 @@
+[Unit]
+Description=Pi GitHub Issue Runner (single tick)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=@INSTALL_DIR@
+Environment=HOME=@HOME@
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:@HOME@/.local/bin
+EnvironmentFile=@INSTALL_DIR@/env
+ExecStart=@INSTALL_DIR@/runner.sh --once
+Nice=5

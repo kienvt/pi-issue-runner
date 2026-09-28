@@ -1,0 +1,28 @@
+{
+  "runner": {
+    "bot_marker": "<!-- pi-runner -->",
+    "poll_interval_sec": 120,
+    "max_tasks_per_tick": 2,
+    "pi_timeout_sec": 1800,
+    "dry_run": false,
+    "status_labels": {
+      "running": "ai-running",
+      "done": "ai-done",
+      "failed": "ai-failed"
+    }
+  },
+  "defaults": {
+    "labels": ["ai", "agent"],
+    "triggers": ["!ai", "!agent", "@ai", "@agent"],
+    "trusted_authors": [],
+    "model": "opencode-go/deepseek-v4.1-flash",
+    "base_branch": "main"
+  },
+  "repos": [
+    {
+      "name": "MyProject",
+      "path": "/absolute/path/to/your/repo",
+      "enabled": true
+    }
+  ]
+}
