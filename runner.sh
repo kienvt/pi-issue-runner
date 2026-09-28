@@ -67,6 +67,7 @@ DEF_LABELS=$(jq -r '(.defaults.labels // ["ai","agent"]) | join(",")' "$CONFIG")
 DEF_TRIGGERS=$(jq -r '(.defaults.triggers // ["!ai","!agent","@ai","@agent"]) | join(",")' "$CONFIG")
 DEF_TRUSTED=$(jq -r '(.defaults.trusted_authors // []) | join(",")' "$CONFIG")
 DEF_MODEL=$(jq -r '.defaults.model // "opencode-go/deepseek-v4.1-flash"' "$CONFIG")
+DEF_AGENT_JSON=$(jq -c '.defaults.agent // "pi"' "$CONFIG")
 DEF_BASE=$(jq -r '.defaults.base_branch // "main"' "$CONFIG")
 BOT_MARKER=$(jq -r '.runner.bot_marker // "<!-- pi-runner -->"' "$CONFIG")
 MAX_TASKS=$(jq -r '.runner.max_tasks_per_tick // 1' "$CONFIG")
@@ -119,10 +120,99 @@ set_issue_status() {
   gh issue edit "$num" -R "$full" "${args[@]}" >/dev/null 2>>"$LOG_FILE" || true
 }
 
+# ---- agent adapters ---------------------------------------------------------
+# Sinh UUID cố định từ session key (cho agent yêu cầu UUID, vd Claude).
+uuid_from_key() {
+  local h; h=$(printf '%s' "$1" | sha256sum | cut -c1-32)
+  printf '%s-%s-4%s-8%s-%s' "${h:0:8}" "${h:8:4}" "${h:13:3}" "${h:17:3}" "${h:20:12}"
+}
+
+# run_agent <worktree> <session_key> <model> <prompt_file> <out_log> <err_log> <agent_json>
+# - out_log nhận text cuối của agent; err_log nhận stderr.
+# - trả về exit code của agent.
+run_agent() {
+  local wt="$1" skey="$2" model="$3" pfile="$4" out="$5" err="$6" agent_json="$7"
+  local type
+  type=$(jq -r 'if type=="object" then (.type // "custom") else . end' <<<"$agent_json")
+  local sp1="$RUNNER_DIR/system-prompt.md" sp2="$RUNNER_DIR/task-rules.md"
+  local prompt; prompt="$(cat "$pfile")"
+  local rc=0
+
+  log "  Agent[$type] running (session=$skey, model=${model:-default}, timeout=${PI_TIMEOUT}s)..."
+
+  case "$type" in
+    pi)
+      local -a args=(--print --approve --session-id "$skey")
+      [ -n "$model" ] && args+=(--model "$model")
+      args+=(--append-system-prompt "$sp1" --append-system-prompt "$sp2" "$prompt")
+      ( cd "$wt" && timeout "$PI_TIMEOUT" pi "${args[@]}" ) >"$out" 2>"$err"; rc=$?
+      ;;
+    omp)
+      # omp không có --session-id; dùng session-dir riêng + --continue
+      local sdir="$RUNNER_DIR/agent-sessions/omp/$skey"; mkdir -p "$sdir"
+      local -a args=(--print --auto-approve --session-dir "$sdir")
+      [ -n "$(ls -A "$sdir" 2>/dev/null)" ] && args+=(--continue)
+      [ -n "$model" ] && args+=(--model "$model")
+      args+=(--append-system-prompt "$sp1" --append-system-prompt "$sp2" "$prompt")
+      ( cd "$wt" && timeout "$PI_TIMEOUT" omp "${args[@]}" ) >"$out" 2>"$err"; rc=$?
+      ;;
+    claude)
+      local uuid; uuid="$(uuid_from_key "$skey")"
+      local sp; sp="$(cat "$sp1"; printf '\n\n'; cat "$sp2")"
+      local -a args=(-p --output-format json --permission-mode acceptEdits \
+                     --allowedTools Bash Edit Write Read Glob Grep WebFetch \
+                     --session-id "$uuid")
+      [ -n "$model" ] && args+=(--model "$model")
+      args+=(--append-system-prompt "$sp" "$prompt")
+      ( cd "$wt" && timeout "$PI_TIMEOUT" claude "${args[@]}" ) >"$out.raw" 2>"$err"; rc=$?
+      if jq -e . "$out.raw" >/dev/null 2>&1; then
+        jq -r '.result // empty' "$out.raw" > "$out" 2>/dev/null || cp "$out.raw" "$out"
+      else
+        cp "$out.raw" "$out"
+      fi
+      rm -f "$out.raw"
+      ;;
+    codex)
+      local sp; sp="$(cat "$sp1"; printf '\n\n'; cat "$sp2")"
+      local full; full="$(printf '%s\n\n---\n\n%s' "$sp" "$prompt")"
+      local sdir="$RUNNER_DIR/agent-sessions/codex"; mkdir -p "$sdir"
+      local sidfile="$sdir/$skey.id"
+      if [ -f "$sidfile" ] && [ -n "$(cat "$sidfile" 2>/dev/null)" ]; then
+        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec resume "$(cat "$sidfile")" --full-auto "$full" ) >"$out" 2>"$err"; rc=$?
+      else
+        ( cd "$wt" && timeout "$PI_TIMEOUT" codex exec --full-auto --json "$full" ) >"$out.raw" 2>"$err"; rc=$?
+        jq -r 'select(.type=="session.created" or .type=="thread.started") | (.session_id // .thread_id // empty)' "$out.raw" 2>/dev/null | head -1 > "$sidfile"
+        jq -r 'select(.type=="item.completed") | (.item.text // empty)' "$out.raw" 2>/dev/null | tail -1 > "$out"
+        [ -s "$out" ] || cp "$out.raw" "$out"
+        rm -f "$out.raw"
+      fi
+      ;;
+    custom)
+      local cmd; cmd=$(jq -r '.command // empty' <<<"$agent_json")
+      if [ -z "$cmd" ]; then echo "custom agent thiếu .command" >&2; return 127; fi
+      local sp; sp="$(cat "$sp1"; printf '\n\n'; cat "$sp2")"
+      local uuid; uuid="$(uuid_from_key "$skey")"
+      local -a args=()
+      while IFS= read -r a; do
+        a="${a//'{prompt}'/$prompt}"
+        a="${a//'{model}'/$model}"
+        a="${a//'{session}'/$uuid}"
+        a="${a//'{system_prompt}'/$sp}"
+        args+=("$a")
+      done < <(jq -r '.args[]? // empty' <<<"$agent_json")
+      ( cd "$wt" && timeout "$PI_TIMEOUT" "$cmd" "${args[@]}" ) >"$out" 2>"$err"; rc=$?
+      ;;
+    *)
+      echo "agent type không hỗ trợ: $type" >&2; rc=127
+      ;;
+  esac
+  return $rc
+}
+
 # ---- one issue --------------------------------------------------------------
 process_issue() {
   local name="$1" path="$2" fullname="$3" base="$4" model="$5"
-  local triggers="$6" trusted="$7" state_file="$8" issue="$9"
+  local triggers="$6" trusted="$7" state_file="$8" issue="$9" agent_json="${10}"
 
   local num title body url key
   num=$(jq -r '.number' <<<"$issue")
@@ -240,13 +330,7 @@ process_issue() {
   # --- run pi ---------------------------------------------------------------
   out_log=$(mktemp); err_log=$(mktemp)
   run_log="$LOG_DIR/${fullname//\//__}_issue-${num}_$(date +%Y%m%d-%H%M%S).log"
-  log "  Running pi (model=$model, timeout=${PI_TIMEOUT}s)..."
-  ( cd "$wt" && timeout "$PI_TIMEOUT" pi --print --approve \
-      --session-id "${name}-issue-$num" \
-      --model "$model" \
-      --append-system-prompt "$RUNNER_DIR/system-prompt.md" \
-      --append-system-prompt "$RUNNER_DIR/task-rules.md" \
-      "$(cat "$prompt_file")" ) >"$out_log" 2>"$err_log"
+  run_agent "$wt" "${name}-issue-$num" "$model" "$prompt_file" "$out_log" "$err_log" "$agent_json"
   local rc=$?
   { echo "===== pi stdout ====="; cat "$out_log"; echo "===== pi stderr ====="; cat "$err_log"; } >"$run_log"
   log "  pi finished rc=$rc (log: $run_log)"
@@ -339,7 +423,7 @@ $txt" >/dev/null 2>>"$LOG_FILE" && log "  Comment posted on $key" || log "  Comm
 # ---- PR feedback ------------------------------------------------------------
 process_pr_feedback() {
   local name="$1" path="$2" fullname="$3" model="$4" triggers="$5" trusted="$6"
-  local state_file="$7" pr="$8"
+  local state_file="$7" pr="$8" agent_json="${9}"
 
   local prnum title branch url linked key
   prnum=$(jq -r '.number' <<<"$pr")
@@ -440,13 +524,7 @@ process_pr_feedback() {
   local out_log err_log run_log rc
   out_log=$(mktemp); err_log=$(mktemp)
   run_log="$LOG_DIR/${fullname//\//__}_pr-${prnum}_$(date +%Y%m%d-%H%M%S).log"
-  log "  Running pi for PR $key (model=$model)..."
-  ( cd "$wt" && timeout "$PI_TIMEOUT" pi --print --approve \
-      --session-id "$sess_id" \
-      --model "$model" \
-      --append-system-prompt "$RUNNER_DIR/system-prompt.md" \
-      --append-system-prompt "$RUNNER_DIR/task-rules.md" \
-      "$(cat "$prompt_file")" ) >"$out_log" 2>"$err_log"
+  run_agent "$wt" "$sess_id" "$model" "$prompt_file" "$out_log" "$err_log" "$agent_json"
   rc=$?
   { echo "===== pi stdout ====="; cat "$out_log"; echo "===== pi stderr ====="; cat "$err_log"; } >"$run_log"
   rm -f "$prompt_file"
@@ -508,7 +586,7 @@ $msg" >/dev/null 2>>"$LOG_FILE" || true
 # ---- one repo ---------------------------------------------------------------
 process_repo() {
   local repo_json="$1"
-  local name path labels triggers trusted model base fullname state_file issues filtered count
+  local name path labels triggers trusted model base fullname state_file issues filtered count agent_json
 
   name=$(jq -r '.name' <<<"$repo_json")
   path=$(jq -r '.path' <<<"$repo_json")
@@ -519,6 +597,7 @@ process_repo() {
   trusted=$(jq -r '(.trusted_authors // []) | join(",")' <<<"$repo_json"); [ -z "$trusted" ] && trusted="$DEF_TRUSTED"
   model=$(jq -r '.model // empty' <<<"$repo_json"); [ -z "$model" ] && model="$DEF_MODEL"
   base=$(jq -r '.base_branch // empty' <<<"$repo_json"); [ -z "$base" ] && base="$DEF_BASE"
+  agent_json=$(jq -c '.agent // empty' <<<"$repo_json"); [ -z "$agent_json" ] && agent_json="$DEF_AGENT_JSON"
 
   if [ ! -d "$path/.git" ] && [ ! -f "$path/.git" ]; then
     log "SKIP $name: '$path' is not a git repo."; return 0
@@ -546,7 +625,7 @@ process_repo() {
   while [ "$i" -lt "$count" ]; do
     [ "$TASKS_DONE" -ge "$MAX_TASKS" ] && ! is_dry && break
     process_issue "$name" "$path" "$fullname" "$base" "$model" \
-                  "$triggers" "$trusted" "$state_file" "$(jq -c ".[$i]" <<<"$filtered")"
+                  "$triggers" "$trusted" "$state_file" "$(jq -c ".[$i]" <<<"$filtered")" "$agent_json"
     i=$((i + 1))
   done
 
@@ -562,7 +641,7 @@ process_repo() {
   while [ "$j" -lt "$pr_count" ]; do
     [ "$TASKS_DONE" -ge "$MAX_TASKS" ] && ! is_dry && break
     process_pr_feedback "$name" "$path" "$fullname" "$model" \
-                        "$triggers" "$trusted" "$state_file" "$(jq -c ".[$j]" <<<"$pr_ai")"
+                        "$triggers" "$trusted" "$state_file" "$(jq -c ".[$j]" <<<"$pr_ai")" "$agent_json"
     j=$((j + 1))
   done
 }

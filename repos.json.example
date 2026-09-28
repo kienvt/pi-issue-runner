@@ -12,6 +12,7 @@
     }
   },
   "defaults": {
+    "agent": "pi",
     "labels": ["ai", "agent"],
     "triggers": ["!ai", "!agent", "@ai", "@agent"],
     "trusted_authors": [],

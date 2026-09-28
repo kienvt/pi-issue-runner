@@ -73,6 +73,40 @@ Mỗi repo có thể override: `labels`, `triggers`, `trusted_authors`, `model`,
 Chỉ comment của tài khoản trong `trusted_authors` mới được xử lý. Comment do runner
 đăng có marker `<!-- pi-runner -->` nên bị bỏ qua → không lặp dù dùng chung tài khoản.
 
+## Chọn agent (pi / omp / claude / codex / custom)
+
+Mặc định dùng `pi`. Đổi ở `defaults.agent`, hoặc override theo từng repo:
+
+```json
+"defaults": { "agent": "omp" },
+"repos": [
+  { "name": "Finance", "path": "/path/Finance", "agent": "pi" },
+  { "name": "Other",   "path": "/path/Other",   "agent": "claude" }
+]
+```
+
+Preset có sẵn:
+
+| agent | Cơ chế | Ghi chú |
+|---|---|---|
+| `pi` | `--print --approve --session-id <key>` | mặc định, đã test |
+| `omp` | `--print --auto-approve --session-dir <dir>` + `--continue` | đã test, session liên tục |
+| `claude` | `-p --output-format json --session-id <UUID>` | UUID sinh cố định từ session key; cần `claude` đã đăng nhập |
+| `codex` | `codex exec --full-auto`, lưu session id để `resume` | cần cài `codex` |
+
+Tùy biến hoàn toàn cho CLI khác:
+
+```json
+"defaults": {
+  "agent": {
+    "type": "custom",
+    "command": "my-agent",
+    "args": ["run", "--model", "{model}", "--session", "{session}", "{prompt}"]
+  }
+}
+```
+Placeholders: `{prompt}`, `{model}`, `{session}`, `{system_prompt}`.
+
 ## Session & bộ nhớ
 
 Mỗi issue = một session cố định (`--session-id <Repo>-issue-<n>`). PR feedback dùng
