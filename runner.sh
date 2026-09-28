@@ -23,6 +23,10 @@ LOG_FILE="$LOG_DIR/runner.log"
 
 mkdir -p "$STATE_DIR" "$LOG_DIR"
 
+# ---- forge layer (gh / glab) ------------------------------------------------
+# shellcheck disable=SC1091
+. "$RUNNER_DIR/forge.sh"
+
 # ---- environment ------------------------------------------------------------
 # shellcheck disable=SC1091
 [ -f "$RUNNER_DIR/env" ] && { set -a; . "$RUNNER_DIR/env"; set +a; }
@@ -69,6 +73,9 @@ DEF_TRUSTED=$(jq -r '(.defaults.trusted_authors // []) | join(",")' "$CONFIG")
 DEF_MODEL=$(jq -r '.defaults.model // "opencode-go/deepseek-v4.1-flash"' "$CONFIG")
 DEF_AGENT_JSON=$(jq -c '.defaults.agent // "pi"' "$CONFIG")
 DEF_BASE=$(jq -r '.defaults.base_branch // "main"' "$CONFIG")
+DEF_FORGE=$(jq -r '.defaults.forge // "auto"' "$CONFIG")
+FORGE="${DEF_FORGE}"; [ "$FORGE" = "auto" ] && FORGE="github"
+FORGE_HOST=""
 BOT_MARKER=$(jq -r '.runner.bot_marker // "<!-- pi-runner -->"' "$CONFIG")
 MAX_TASKS=$(jq -r '.runner.max_tasks_per_tick // 1' "$CONFIG")
 PI_TIMEOUT=$(jq -r '.runner.pi_timeout_sec // 1800' "$CONFIG")
@@ -90,13 +97,8 @@ is_dry() { [ "$DRY_RUN" = "true" ] || [ "$DRY_RUN" = "1" ]; }
 
 # ---- helpers ----------------------------------------------------------------
 repo_fullname() {
-  local url
-  url=$(git -C "$1" remote get-url origin 2>/dev/null) || return 1
-  url="${url%.git}"
-  url="${url#git@github.com:}"
-  url="${url#https://github.com/}"
-  url="${url#http://github.com/}"
-  printf '%s' "$url"
+  # (giữ lại cho tương thích; dùng forge_detect cho đa nền tảng)
+  forge_detect "$1" && printf '%s' "$FORGE_FULLNAME"
 }
 
 build_trigger_regex() {  # comma-separated triggers -> regex with word boundaries
@@ -118,11 +120,11 @@ truncate_tail() { tail -c "${2:-4000}" "$1" 2>/dev/null || true; }
 set_issue_status() {
   local num="$1" full="$2" add="$3" remove="$4"
   is_dry && return 0
-  local args=()
-  [ "$add" != "-" ] && args+=(--add-label "$add")
-  [ "$remove" != "-" ] && args+=(--remove-label "$remove")
-  [ ${#args[@]} -eq 0 ] && return 0
-  gh issue edit "$num" -R "$full" "${args[@]}" >/dev/null 2>>"$LOG_FILE" || true
+  local a="" r=""
+  [ "$add" != "-" ] && a="$add"
+  [ "$remove" != "-" ] && r="$remove"
+  [ -z "$a" ] && [ -z "$r" ] && return 0
+  forge_set_labels "$full" "$num" "$a" "$r" >/dev/null 2>>"$LOG_FILE" || true
 }
 
 # ---- agent adapters ---------------------------------------------------------
@@ -230,16 +232,12 @@ run_review() {
   [ -n "$pr_num" ] || return 0
 
   local base
-  base=$(gh pr view "$pr_num" -R "$fullname" --json baseRefName --jq '.baseRefName' 2>/dev/null)
+  base=$(forge_mr_target "$fullname" "$pr_num")
   [ -n "$base" ] || base="main"
 
   local issue_ctx=""
   if [ -n "$issue_num" ]; then
-    issue_ctx=$(gh issue view "$issue_num" -R "$fullname" --json title,body,comments --jq '
-        "# " + .title + "\n\n" + (.body // "") + "\n\n## Comments\n" +
-        ([.comments[]
-          | select(((.body // "") | contains("<!-- pi-runner -->") | not))
-          | "- @" + .author.login + ": " + (.body // "")] | join("\n"))' 2>/dev/null)
+    issue_ctx=$(forge_issue_context "$fullname" "$issue_num")
   fi
 
   local diffstat
@@ -268,7 +266,7 @@ run_review() {
     echo "- Xem diff đầy đủ: \`git diff origin/$base...HEAD\` và mở các file liên quan (dùng tool đọc file)."
     echo "- Đọc AGENTS.md / CLAUDE.md / CONTRIBUTING.md / README / docs để nắm rule & kiến trúc của repo."
     echo "- Đánh giá theo đúng \`review-rules.md\`."
-    echo "- KHÔNG sửa file, KHÔNG commit/push, KHÔNG chạy gh. Chỉ xuất nội dung review cuối cùng."
+    echo "- KHÔNG sửa file, KHÔNG commit/push, KHÔNG chạy gh/glab. Chỉ xuất nội dung review cuối cùng."
   } >"$pfile"
 
   local rev_model="$model"; [ -n "$REV_MODEL" ] && rev_model="$REV_MODEL"
@@ -291,7 +289,7 @@ run_review() {
   local body
   body=$(truncate_tail "$out_log" 12000)
   [ -n "$body" ] || body=$(printf 'Review thất bại (rc=%s). Xem log: `%s`' "$rc" "$run_log")
-  if gh pr comment "$pr_num" -R "$fullname" --body "$BOT_MARKER
+  if forge_mr_note "$fullname" "$pr_num" "$BOT_MARKER
 $body" >/dev/null 2>>"$LOG_FILE"; then
     log "  Đã đăng AI review lên PR #$pr_num (rc=$rc)"
   else
@@ -451,13 +449,12 @@ process_issue() {
     git -C "$wt" fetch origin "$branch" --quiet 2>/dev/null || true
     if git -C "$wt" push -u origin "$branch" --force-with-lease >>"$LOG_FILE" 2>&1 \
        || git -C "$wt" push -u origin "$branch" --force >>"$LOG_FILE" 2>&1; then
-      pr_url=$(gh pr list -R "$fullname" --head "$branch" --state open --json url --jq '.[0].url // empty' 2>/dev/null)
+      pr_url=$(forge_mr_find "$fullname" "$branch")
       if [ -z "$pr_url" ]; then
         local pr_body
         pr_body=$(printf 'Tự động xử lý issue #%s.\n\nCloses #%s\n\n---\n\n<details><summary>Tóm tắt từ agent</summary>\n\n```\n%s\n```\n\n</details>\n\n_Mở bởi pi-issue-runner._' \
           "$num" "$num" "$summary")
-        pr_url=$(gh pr create -R "$fullname" --base "$run_base" --head "$branch" \
-            --title "ai: #$num — $title" --body "$pr_body" 2>>"$LOG_FILE")
+        pr_url=$(forge_mr_create "$fullname" "$run_base" "$branch" "ai: #$num — $title" "$pr_body" 2>>"$LOG_FILE")
       fi
       log "  PR: ${pr_url:-<failed>}"
     else
@@ -467,7 +464,7 @@ process_issue() {
 
   post_comment() {
     local txt="$1"
-    gh issue comment "$num" -R "$fullname" --body "$BOT_MARKER
+    forge_issue_note "$fullname" "$num" "$BOT_MARKER
 $txt" >/dev/null 2>>"$LOG_FILE" && log "  Comment posted on $key" || log "  Comment failed on $key"
   }
 
@@ -535,12 +532,8 @@ process_pr_feedback() {
   trig_re=$(build_trigger_regex "$triggers")
   trusted_json=$(csv_to_json "$trusted")
 
-  local conv review allc new_triggers nt
-  conv=$(jq -c '[ (.comments // [])[] | {author: {login: (.author.login // "")}, body: (.body // ""), url: (.url // "")} ]' <<<"$pr")
-  review=$(gh api --paginate "repos/$fullname/pulls/$prnum/comments" 2>/dev/null \
-            | jq -c '[ .[] | {author: {login: (.user.login // "")}, body: (.body // ""), url: (.html_url // "")} ]' 2>/dev/null)
-  [ -n "$review" ] || review='[]'
-  allc=$(jq -cn --argjson a "$conv" --argjson b "$review" '$a + $b')
+  local allc new_triggers nt
+  allc=$(jq -c '[ (.comments // [])[] | {author: {login: (.author.login // "")}, body: (.body // ""), url: (.url // "")} ]' <<<"$pr")
 
   new_triggers=$(jq -c \
       --arg re "$trig_re" --arg marker "$BOT_MARKER" \
@@ -589,7 +582,7 @@ process_pr_feedback() {
 
   local prompt_file; prompt_file=$(mktemp)
   local linked_ctx=""
-  [ -n "$linked" ] && linked_ctx=$(gh issue view "$linked" -R "$fullname" --json title,body --jq '"# " + .title + "\n\n" + (.body // "")' 2>/dev/null)
+  [ -n "$linked" ] && linked_ctx=$(forge_issue_context "$fullname" "$linked")
   {
     echo "# Phản hồi trên Pull Request"
     echo
@@ -660,7 +653,7 @@ process_pr_feedback() {
   else
     msg=$(printf '🤖 Đã chạy agent nhưng **không có thay đổi mới**.\n\n```\n%s\n```' "$summary")
   fi
-  gh pr comment "$prnum" -R "$fullname" --body "$BOT_MARKER
+  forge_mr_note "$fullname" "$prnum" "$BOT_MARKER
 $msg" >/dev/null 2>>"$LOG_FILE" || true
 
   # --- auto review PR -------------------------------------------------------
@@ -702,46 +695,54 @@ process_repo() {
   if [ ! -d "$path/.git" ] && [ ! -f "$path/.git" ]; then
     log "SKIP $name: '$path' is not a git repo."; return 0
   fi
-  fullname=$(repo_fullname "$path") || { log "SKIP $name: cannot resolve origin."; return 0; }
+  forge_detect "$path" || { log "SKIP $name: cannot resolve origin."; return 0; }
+  fullname="$FORGE_FULLNAME"
+  local repo_forge; repo_forge=$(jq -r '.forge // empty' <<<"$repo_json"); [ -n "$repo_forge" ] && FORGE="$repo_forge"
+  log "  forge=$FORGE host=${FORGE_HOST:-<default>}"
 
   log "=== Repo $name ($fullname) ==="
   state_file="$STATE_DIR/${fullname//\//__}.json"
   [ -f "$state_file" ] || echo '{}' > "$state_file"
 
-  issues=$(gh issue list -R "$fullname" --state open --limit 100 \
-            --json number,title,body,url,labels,comments,author,updatedAt,createdAt 2>>"$LOG_FILE")
-  [ -n "$issues" ] || { log "  (no issues or gh failed)"; issues='[]'; }
+  issues=$(forge_issue_list "$fullname")
+  [ -n "$issues" ] || { log "  (no issues or forge failed)"; issues='[]'; }
 
   local label_json
   label_json=$(csv_to_json "$labels")
   filtered=$(jq -c --argjson want "$label_json" '
-      [ .[] | select(((.labels | map(.name)) as $l
-                      | ($want | any(. as $w | $l | index($w))))) ]
+      [ .[] | select((.labels) as $l
+                      | ($want | any(. as $w | $l | index($w)))) ]
       | sort_by(.createdAt)' <<<"$issues")
   count=$(jq 'length' <<<"$filtered")
   log "  Labeled issues: $count"
 
-  local i=0
+  local i=0 issue comments
   while [ "$i" -lt "$count" ]; do
     [ "$TASKS_DONE" -ge "$MAX_TASKS" ] && ! is_dry && break
+    issue=$(jq -c ".[$i]" <<<"$filtered")
+    comments=$(forge_issue_comments "$fullname" "$(jq -r '.number' <<<"$issue")")
+    issue=$(jq -c --argjson c "$comments" '.comments = $c' <<<"$issue")
     process_issue "$name" "$path" "$fullname" "$base" "$model" \
-                  "$triggers" "$trusted" "$state_file" "$(jq -c ".[$i]" <<<"$filtered")" "$agent_json"
+                  "$triggers" "$trusted" "$state_file" "$issue" "$agent_json"
     i=$((i + 1))
   done
 
   # --- PR feedback -----------------------------------------------------------
   local prs pr_ai pr_count j
-  prs=$(gh pr list -R "$fullname" --state open --limit 100 \
-          --json number,title,body,url,headRefName,comments,author,updatedAt,createdAt 2>>"$LOG_FILE")
+  prs=$(forge_mr_list "$fullname")
   [ -n "$prs" ] || prs='[]'
   pr_ai=$(jq -c '[ .[] | select(.headRefName | test("^ai/issue-[0-9]+$")) ]' <<<"$prs")
   pr_count=$(jq 'length' <<<"$pr_ai")
   log "  AI PRs: $pr_count"
+  local pr
   j=0
   while [ "$j" -lt "$pr_count" ]; do
     [ "$TASKS_DONE" -ge "$MAX_TASKS" ] && ! is_dry && break
+    pr=$(jq -c ".[$j]" <<<"$pr_ai")
+    comments=$(forge_mr_comments "$fullname" "$(jq -r '.number' <<<"$pr")")
+    pr=$(jq -c --argjson c "$comments" '.comments = $c' <<<"$pr")
     process_pr_feedback "$name" "$path" "$fullname" "$model" \
-                        "$triggers" "$trusted" "$state_file" "$(jq -c ".[$j]" <<<"$pr_ai")" "$agent_json"
+                        "$triggers" "$trusted" "$state_file" "$pr" "$agent_json"
     j=$((j + 1))
   done
 }

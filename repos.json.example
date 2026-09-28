@@ -18,6 +18,7 @@
   },
   "defaults": {
     "agent": "pi",
+    "forge": "auto",
     "labels": ["ai", "agent"],
     "triggers": ["!ai", "!agent", "@ai", "@agent"],
     "trusted_authors": [],

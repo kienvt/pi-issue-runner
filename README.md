@@ -60,6 +60,31 @@ Sau khi cài:
 
 Mỗi repo có thể override: `labels`, `triggers`, `trusted_authors`, `model`, `base_branch`.
 
+## GitLab (dùng `glab`)
+
+Runner hỗ trợ GitLab qua lớp `forge.sh`. Chỉ cần:
+
+1. Cài `glab` và đăng nhập: `glab auth login` (self-hosted: `glab auth login --hostname gitlab.example.com`).
+2. Trong `repos.json` để `"forge": "auto"` (tự nhận theo remote) hoặc ép `"forge": "gitlab"`.
+3. `GITLAB_TOKEN` được installer ghi vào `env`; self-hosted đặt thêm `GITLAB_HOST=gitlab.example.com` trong `env`.
+
+Ánh xạ khái niệm:
+
+| GitHub | GitLab |
+|---|---|
+| Issue + label | Issue + label |
+| Pull Request (PR) | Merge Request (MR) |
+| `gh` | `glab api` (REST v4) |
+| Review inline | MR discussion notes |
+
+Chi tiết:
+- Repo local phải là clone GitLab (remote `git@gitlab.com:group/proj.git` hoặc https).
+- `fullname` là `group/project` (hỗ trợ subgroup, tự URL-encode `%2F`).
+- Trigger giống GitHub: label `ai`/`agent`, comment `!ai`/`@agent`..., sửa body issue, comment trên MR.
+- Mọi thao tác ghi dùng GitLab API v4 qua `glab api`.
+
+> Lưu ý: phần GitLab viết theo GitLab API v4 + glab 1.x, đã kiểm tra cú pháp CLI nhưng **chưa test end-to-end trên GitLab thật** (máy build chưa có token GitLab). Cần thử với 1 repo nhỏ trước.
+
 ## Cách kích hoạt
 
 | Hành động | Cách làm |
